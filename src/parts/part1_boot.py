@@ -26,7 +26,7 @@ import importlib
 import importlib.util
 
 APP_NAME = "Balance Confirmation Generator"
-APP_VERSION = "3.4"
+APP_VERSION = "3.5"
 
 # ---------------------------------------------------------------------------
 # SECTION 1 - FIRST-RUN DEPENDENCY INSTALLER

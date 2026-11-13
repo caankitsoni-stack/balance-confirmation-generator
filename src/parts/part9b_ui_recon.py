@@ -61,18 +61,35 @@
         self.recon_stats = QHBoxLayout()
         self.recon_stats.setSpacing(10)
         body.addLayout(self.recon_stats)
+        # replies waiting for a decision are never left for the reviewer to
+        # stumble on: the page says so and takes them there
+        self.btn_queue = button("", "brass")
+        self.btn_queue.setToolTip("Open the Exception Queue")
+        self.btn_queue.clicked.connect(
+            lambda: self.show_report(REPORT_EXCEPTIONS))
+        self.btn_queue.setVisible(False)
+        queue_row = QHBoxLayout()
+        queue_row.addWidget(self.btn_queue)
+        queue_row.addStretch(1)
+        body.addLayout(queue_row)
         layout.addWidget(frame)
 
         frame2, body2, header2 = card("Reports", "", light=True)
         self.report_note = QLabel("")
         self.report_note.setObjectName("HintLight")
         header2.addWidget(self.report_note)
-        self.btn_assign = button("Assign reply…")
+        self.btn_assign = button("Review reply…")
         self.btn_assign.setToolTip(
-            "Decide which party a reply in the exception queue belongs to, "
-            "or set it aside as not being a confirmation")
+            "Read the selected reply, choose the party and request it "
+            "belongs to, and accept the confirmed value - or set it aside")
         self.btn_assign.clicked.connect(self.assign_selected_reply)
         header2.addWidget(self.btn_assign)
+        self.btn_audit = button("Audit status…")
+        self.btn_audit.setToolTip(
+            "Create or open the follow-up record for the selected "
+            "confirmation")
+        self.btn_audit.clicked.connect(self.audit_selected_row)
+        header2.addWidget(self.btn_audit)
         excel = button("Export all to Excel", "primary")
         excel.clicked.connect(self.export_reports_excel)
         pdf = button("Export all to PDF", "blue")
@@ -97,6 +114,7 @@
 
         self.report_table = table([""])
         self.report_table.setMinimumHeight(360)
+        self.report_table.cellClicked.connect(self.on_report_cell)
         body2.addWidget(self.report_table)
         self.report_totals = QLabel("")
         self.report_totals.setObjectName("HintLight")
@@ -143,6 +161,9 @@
     def refresh_recon(self):
         documents = self.sent_documents()
         replies = self.stored_replies()
+        for held in replies:    # dates recorded a day early by older builds
+            if held.get("received_at"):
+                held["received_at"] = local_stamp(held["received_at"])
         settings = self.db["settings"]
         mail = settings.get("mail") or {}
         self.recon_ignored = []
@@ -156,6 +177,7 @@
             # bridge: our own letter must never be counted as a reply
             own_addresses=(mail.get("username"), mail.get("sender")),
             ignored=self.recon_ignored, set_aside=self.recon_set_aside)
+        attach_audit_status(self.recon_rows, self.audit_records())
         self.recon_summary = summarise(self.recon_rows)
 
         client = self.active_client()
@@ -178,7 +200,7 @@
         for key, value, meta, accent in (
                 ("Sent", summary["sent"], "Confirmations issued", T["accent"]),
                 ("Received", summary["received"], "Replies matched", T["info"]),
-                ("Agreed", summary["agreed"], "Within tolerance", T["ok"]),
+                ("Matched", summary["agreed"], "No variance", T["ok"]),
                 ("Mismatch", summary["variance"],
                  "Differs from books", T["err"]),
                 ("Review", len(self.recon_exceptions),
@@ -189,6 +211,12 @@
                  "By value of balances", T["accent_hi"])):
             self.recon_stats.addWidget(stat_card(key, value, meta, accent))
         self.recon_stats.addStretch(1)
+        waiting = len(self.recon_exceptions)
+        self.btn_queue.setVisible(bool(waiting))
+        self.btn_queue.setText(
+            "%d repl%s received but not yet counted - review %s in the "
+            "Exception Queue" % (waiting, "y" if waiting == 1 else "ies",
+                                 "it" if waiting == 1 else "them"))
         self.refresh_bridge_note()
         self.refresh_reader_note()
         self.render_report()
@@ -198,20 +226,36 @@
         if not hasattr(self, "recon_rows"):
             self.recon_rows, self.recon_exceptions = [], []
         return build_all_reports(
-            self.recon_rows, self.recon_exceptions,
-            {"reminders": tuple(self.db["settings"].get("reminder_days",
-                                                        DEFAULT_REMINDERS))})
+            self.recon_rows, self.recon_exceptions, self.report_context())
+
+    def report_context(self):
+        return {"reminders": tuple(self.db["settings"].get(
+                    "reminder_days", DEFAULT_REMINDERS)),
+                "audit_records": self.audit_records()}
+
+    def audit_records(self):
+        """Follow-up records for the confirmations of this client and year."""
+        keys = {document_key(d) for d in self.sent_documents()}
+        return [r for r in self.db.setdefault("audit_status", [])
+                if r.get("document_id") in keys]
+
+    def show_report(self, key):
+        index = self.report_combo.findData(key)
+        if index >= 0:
+            self.report_combo.setCurrentIndex(index)
+            self.render_report()
 
     def render_report(self):
         key = self.report_combo.currentData()
         report = build_report(key, getattr(self, "recon_rows", []),
                               getattr(self, "recon_exceptions", []),
-                              {"reminders": tuple(
-                                  self.db["settings"].get("reminder_days",
-                                                          DEFAULT_REMINDERS))})
+                              self.report_context())
+        self.current_report = report
         self.report_subtitle.setText(report["subtitle"])
         if hasattr(self, "btn_assign"):
             self.btn_assign.setVisible(key == REPORT_EXCEPTIONS)
+            self.btn_audit.setVisible(key in (REPORT_COMPARISON,
+                                              REPORT_REGISTER, REPORT_AUDIT))
         headings = [h for h, _k, _t in report["columns"]]
         self.report_table.clear()
         self.report_table.setColumnCount(len(headings))
@@ -226,12 +270,22 @@
             for column_index, (_heading, field, kind) in enumerate(
                     report["columns"]):
                 value = row.get(field)
+                is_link = kind in ("link", "action")
+                if is_link:
+                    # on screen a link says what clicking it does
+                    value = row.get(field + "_link", value)
                 text = format_cell(value, kind, currency)
                 item = cell(text,
                             align_right=kind in ("money", "number", "pct",
                                                  "pct_unit"),
-                            color=tone.get(value) if kind == "status" else None,
+                            color=(tone.get(value) if kind == "status" else
+                                   T["info"] if is_link and text else None),
                             bold=kind == "status")
+                if is_link and text:
+                    font = item.font()
+                    font.setUnderline(True)
+                    item.setFont(font)
+                    item.setToolTip("Click to open")
                 self.report_table.setItem(row_index, column_index, item)
         self.report_table.resizeColumnsToContents()
         # fill the width rather than leaving a bare strip beside the last column
@@ -251,23 +305,52 @@
                                                "" if len(report["rows"]) == 1
                                                else "s"))
 
+    # ------------------------------------------------ links in the reports
+    def on_report_cell(self, row_index, column_index):
+        report = getattr(self, "current_report", None)
+        if not report or row_index >= len(report["rows"]) or \
+                column_index >= len(report["columns"]):
+            return
+        _heading, field, kind = report["columns"][column_index]
+        row = report["rows"][row_index]
+        if kind == "action" and field == "review":
+            self.review_exception(row)
+        elif kind == "link" and (row.get(field + "_link") or row.get(field)):
+            self.open_audit_status(row)
+
+    def reviewer_names(self):
+        names = [str(a.get("name") or "").strip()
+                 for a in self.db["settings"].get("auditors", [])]
+        last = str(self.db["settings"].get("last_reviewer") or "").strip()
+        ordered = ([last] if last else []) + [n for n in names if n != last]
+        return [name for name in ordered if name]
+
     # ------------------------------------------- deciding a reply by hand
-    def assign_reply(self, reply_id, target):
-        """Record the auditor's decision on one reply.
+    def assign_reply(self, reply_id, target, amount=None, by="", note=""):
+        """Record the reviewer's decision on one reply.
 
         target is a confirmation's id, SET_ASIDE (not a confirmation for any
-        party), or "" to hand the reply back to automatic matching.  The
-        decision and when it was made are kept on the reply itself."""
+        party), or "" to hand the reply back to automatic matching.  amount
+        is the confirmed value the reviewer accepted.  The decision, who made
+        it and when stay on the reply itself, beside the original e-mail's
+        id, sender, date and link, so both can be traced later."""
         for reply in self.db.get("replies", []):
             if str(reply.get("id")) != str(reply_id):
                 continue
+            for field in ("assigned_to", "assigned_at", "accepted_amount",
+                          "decided_by", "decided_at", "decision_note"):
+                reply.pop(field, None)
             if target:
+                stamp = datetime.now().isoformat(timespec="seconds")
                 reply["assigned_to"] = target
-                reply["assigned_at"] = datetime.now().isoformat(
-                    timespec="seconds")
-            else:
-                reply.pop("assigned_to", None)
-                reply.pop("assigned_at", None)
+                reply["assigned_at"] = stamp
+                reply["decided_at"] = stamp
+                reply["decided_by"] = str(by or "").strip()
+                reply["decision_note"] = str(note or "").strip()
+                if amount is not None and target != SET_ASIDE:
+                    reply["accepted_amount"] = float(amount)
+                if reply["decided_by"]:
+                    self.db["settings"]["last_reviewer"] = reply["decided_by"]
             self.persist()
             self.refresh_recon()
             return True
@@ -275,74 +358,350 @@
 
     def assign_selected_reply(self):
         if self.report_combo.currentData() != REPORT_EXCEPTIONS:
-            self.toast("Open the Exception queue and select a reply first.",
+            self.toast("Open the Exception Queue and select a reply first.",
                        "warn")
             return
         index = self.report_table.currentRow()
         queue = getattr(self, "recon_exceptions", [])
         if index < 0 or index >= len(queue):
-            self.toast("Select a reply in the Exception queue first.", "warn")
+            self.toast("Select a reply in the Exception Queue first.", "warn")
             return
-        entry = queue[index]
+        self.review_exception(queue[index])
+
+    def review_exception(self, entry):
+        """Review one reply from the queue and act on the decision."""
         if not entry.get("reply_id"):
-            self.toast("That row has no reply to assign.", "warn")
+            self.toast("That row has no reply to review.", "warn")
             return
-        target = self.choose_party_dialog(entry)
-        if target is None:
+        decision = self.choose_party_dialog(entry)
+        if decision is None:
             return
-        self.assign_reply(entry["reply_id"], target)
+        if not isinstance(decision, dict):          # a bare target
+            decision = {"target": decision, "amount": entry.get("amount"),
+                        "by": "", "note": ""}
+        target = decision.get("target", "")
+        self.assign_reply(entry["reply_id"], target,
+                          decision.get("amount"), decision.get("by", ""),
+                          decision.get("note", ""))
         if target == SET_ASIDE:
             self.toast("Reply set aside: it is kept on record but not "
                        "counted.", "ok")
         elif target:
-            party = next((d.get("party_name") for d in self.sent_documents()
-                          if document_key(d) == target), "the party")
-            self.toast("Reply recorded against %s." % party, "ok")
+            row = next((r for r in self.recon_rows
+                        if r["document_id"] == target), None)
+            self.toast("Accepted for %s: %s." % (
+                row["party_name"] if row else "the party",
+                row["status"] if row else "recorded"), "ok")
         else:
             self.toast("Reply handed back to automatic matching.", "ok")
 
     def choose_party_dialog(self, entry):
-        """Ask which confirmation a reply answers.  Returns a document id,
-        SET_ASIDE, "" for automatic matching, or None if cancelled."""
+        """The review window for one reply.
+
+        Shows the e-mail as received, offers the party the evidence suggests,
+        and takes the reviewer's choice of party and request, the confirmed
+        value, their name and a note.  Returns {target, amount, by, note},
+        or None if cancelled."""
+        reply = next((r for r in self.db.get("replies", [])
+                      if str(r.get("id")) == str(entry.get("reply_id"))), {})
         dialog = QDialog(self)
-        dialog.setWindowTitle("Assign reply")
+        dialog.setWindowTitle("Review reply")
+        dialog.setMinimumWidth(640)
         layout = QVBoxLayout(dialog)
+
+        link = str(entry.get("message_link") or "")
         facts = QLabel(
-            "<b>From:</b> %s<br><b>Received:</b> %s<br><b>Subject:</b> %s"
-            "<br><b>Amount read:</b> %s<br><b>Why it is here:</b> %s" % (
-                xml_escape(entry.get("from_email") or "unknown"),
+            "<b>From:</b> %s %s<br><b>Received:</b> %s<br><b>Subject:</b> %s"
+            "<br><b>Why it is here:</b> %s%s" % (
+                xml_escape(entry.get("from_name") or ""),
+                xml_escape("<%s>" % (entry.get("from_email") or "unknown")),
                 xml_escape(fmt_date_long(str(entry.get("received_at")
                                              or "")[:10]) or
                            str(entry.get("received_at") or "")),
                 xml_escape(entry.get("subject") or ""),
-                xml_escape(fmt_amount(entry.get("amount"),
-                                      entry.get("currency") or "INR")
-                           or "none"),
-                xml_escape(entry.get("reason") or "")))
+                xml_escape(entry.get("reason") or ""),
+                ('<br><a href="%s" style="color: %s;">Open the original '
+                 'e-mail</a>' % (xml_escape(link), T["info"]))
+                if link else ""))
         facts.setWordWrap(True)
+        facts.setOpenExternalLinks(True)
         layout.addWidget(facts)
-        layout.addWidget(QLabel("Record this reply against:"))
+
+        words = QPlainTextEdit()
+        words.setReadOnly(True)
+        words.setPlainText(strip_quoted(str(reply.get("body") or ""))
+                           or "(the reply has no text of its own)")
+        words.setMaximumHeight(120)
+        layout.addWidget(QLabel("What the party wrote:"))
+        layout.addWidget(words)
+
+        hint = QLabel("")
+        hint.setWordWrap(True)
+        if entry.get("suggested_to"):
+            hint.setText("<b>Suggested:</b> %s - %s." % (
+                xml_escape(entry.get("suggested_party") or ""),
+                xml_escape(entry.get("suggestion") or "")))
+        elif entry.get("candidates"):
+            hint.setText("<b>Evidence points to:</b> %s. No single party "
+                         "can be suggested with confidence - choose one."
+                         % xml_escape(entry["candidates"]))
+        else:
+            hint.setText("Nothing in the reply identifies a party - "
+                         "choose one.")
+        layout.addWidget(hint)
+
+        form = QFormLayout()
         combo = QComboBox()
+        combo.addItem("Choose the party and request…", None)
         for document in sorted(self.sent_documents(),
                                key=lambda d: (d.get("party_name", "").lower(),
                                               d.get("category", ""))):
-            combo.addItem("%s — %s — %s" % (
+            combo.addItem("%s — %s — %s — books %s" % (
                 document.get("party_name", ""), document.get("category", ""),
+                document.get("reference", "") or "no reference",
                 fmt_amount(document.get("amount"),
                            document.get("currency") or "INR")),
                 document_key(document))
         combo.addItem("Set aside — not a confirmation for any party",
                       SET_ASIDE)
         combo.addItem("Return it to automatic matching", "")
-        layout.addWidget(combo)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                                   QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
+        if entry.get("suggested_to"):
+            combo.setCurrentIndex(max(0, combo.findData(
+                entry["suggested_to"])))
+        combo.setObjectName("review_party")
+        form.addRow("Belongs to", combo)
+
+        amount = QLineEdit()
+        if entry.get("amount") is not None:
+            amount.setText("%.2f" % entry["amount"])
+        amount.setPlaceholderText("the balance the party confirms")
+        amount.setObjectName("review_amount")
+        form.addRow("Confirmed value", amount)
+
+        reviewer = QComboBox()
+        reviewer.setEditable(True)
+        reviewer.addItems(self.reviewer_names())
+        if not self.reviewer_names():
+            reviewer.setEditText("")
+        reviewer.setObjectName("review_by")
+        form.addRow("Reviewed by", reviewer)
+        note = QLineEdit()
+        note.setObjectName("review_note")
+        note.setPlaceholderText("optional - why this party, or why set aside")
+        form.addRow("Note", note)
+        layout.addLayout(form)
+
+        problem = QLabel("")
+        problem.setObjectName("review_problem")
+        problem.setWordWrap(True)
+        problem.setStyleSheet("color: %s;" % T["err"])
+        layout.addWidget(problem)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        accept = buttons.addButton("Accept",
+                                   QDialogButtonBox.ButtonRole.AcceptRole)
+        accept.setObjectName("review_accept")
         layout.addWidget(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        decision = {}
+
+        def try_accept():
+            target = combo.currentData()
+            if target is None:
+                problem.setText("Choose the party and request this reply "
+                                "belongs to, or set it aside.")
+                return
+            value = None
+            if target and target != SET_ASIDE:
+                value = parse_amount(amount.text())[0] \
+                    if amount.text().strip() else None
+                if value is None:
+                    problem.setText("Enter the confirmed value as a number, "
+                                    "for example 2311786 or 23,11,786.00.")
+                    return
+            name = reviewer.currentText().strip()
+            if target != "" and not name:
+                problem.setText("Enter the name of the person reviewing "
+                                "this reply.")
+                return
+            decision.update(target=target, amount=value, by=name,
+                            note=note.text().strip())
+            dialog.accept()
+
+        accept.clicked.connect(try_accept)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not decision:
             return None
-        return combo.currentData()
+        return decision
+
+    # ------------------------------------------------ audit-status records
+    def audit_selected_row(self):
+        report = getattr(self, "current_report", None)
+        index = self.report_table.currentRow()
+        if not report or index < 0 or index >= len(report["rows"]):
+            self.toast("Select a confirmation in the table first.", "warn")
+            return
+        self.open_audit_status(report["rows"][index])
+
+    def save_audit_status(self, row, state, nature, owner, notes, by=""):
+        """Create the follow-up record for a confirmation, or update it.
+
+        The record is tied to the party, the request sent and the reply
+        received, and every change is added to its history."""
+        records = self.db.setdefault("audit_status", [])
+        record = audit_record_for(records, row.get("document_id"))
+        stamp = datetime.now().isoformat(timespec="seconds")
+        if record is None:
+            record = {"id": new_id(), "created_at": stamp,
+                      "created_by": str(by or owner or "").strip(),
+                      "history": []}
+            client, year = self.active_client(), self.active_fy()
+            record["client_id"] = client["id"] if client else None
+            record["fy_id"] = year["id"] if year else None
+            records.append(record)
+        record.update(audit_snapshot(row))
+        record.update(state=state, nature=nature,
+                      owner=str(owner or "").strip(),
+                      notes=str(notes or "").strip(), updated_at=stamp)
+        record["history"].append({
+            "at": stamp, "by": str(by or owner or "").strip(),
+            "state": state, "nature": nature,
+            "confirmation_status": row.get("status", ""),
+            "notes": str(notes or "").strip()})
+        self.persist()
+        self.refresh_recon()
+        return record
+
+    def open_audit_status(self, row):
+        # a row of the audit report is the record itself; find the live row
+        live = next((r for r in getattr(self, "recon_rows", [])
+                     if r["document_id"] == row.get("document_id")), None)
+        if live is None:
+            self.toast("That confirmation is no longer on record.", "warn")
+            return
+        record = audit_record_for(self.audit_records(), live["document_id"])
+        if record is None and not needs_audit_status(live):
+            self.toast("An audit-status record is opened for a Mismatch or "
+                       "a reply that Needs Review. %s is %s."
+                       % (live["party_name"], live["status"]), "info")
+            return
+        result = self.audit_status_dialog(live, record)
+        if result is None:
+            return
+        self.save_audit_status(live, result["state"], result["nature"],
+                               result["owner"], result["notes"],
+                               result["owner"])
+        self.toast("Audit status saved for %s: %s."
+                   % (live["party_name"], result["state"]), "ok")
+
+    def audit_status_dialog(self, row, record):
+        """Create or edit the follow-up record.  Returns {state, nature,
+        owner, notes} or None if cancelled."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Audit status - %s" % row["party_name"])
+        dialog.setMinimumWidth(620)
+        layout = QVBoxLayout(dialog)
+        money = lambda value: (fmt_amount(value, row.get("currency") or "INR")
+                               if value is not None else "-")
+        link = str(row.get("message_link") or "")
+        facts = QLabel(
+            "<b>Party:</b> %s (%s)<br>"
+            "<b>Request:</b> reference %s, sent %s to %s<br>"
+            "<b>Reply:</b> %s<br>"
+            "<b>As per books:</b> %s &nbsp; <b>Confirmed:</b> %s &nbsp; "
+            "<b>Variance:</b> %s<br><b>Confirmation status:</b> %s<br>%s%s"
+            % (xml_escape(row["party_name"]), xml_escape(row["category"]),
+               xml_escape(row.get("reference") or "-"),
+               xml_escape(fmt_date_long(str(row.get("sent_at") or "")[:10])
+                          or "-"),
+               xml_escape(row.get("email") or "-"),
+               xml_escape(("from %s, received %s%s" % (
+                   row.get("reply_from") or "unknown sender",
+                   fmt_date_long(str(row.get("received_at") or "")[:10])
+                   or "date unknown",
+                   " (%d replies on record)" % row["replies_count"]
+                   if row.get("replies_count", 0) > 1 else ""))
+                   if row.get("replies_count") else "none counted yet"),
+               xml_escape(money(row.get("books_amount"))),
+               xml_escape(money(row.get("confirmed_amount"))),
+               xml_escape(money(row.get("variance"))),
+               xml_escape(row.get("status", "")),
+               xml_escape(row.get("note") or ""),
+               ('<br><a href="%s" style="color: %s;">Open the original '
+                'e-mail</a>' % (xml_escape(link), T["info"]))
+               if link else ""))
+        facts.setWordWrap(True)
+        facts.setOpenExternalLinks(True)
+        layout.addWidget(facts)
+
+        form = QFormLayout()
+        state = QComboBox()
+        state.addItems(AUDIT_STATES)
+        nature = QComboBox()
+        nature.addItems(AUDIT_NATURES)
+        owner = QComboBox()
+        owner.setEditable(True)
+        owner.addItems(self.reviewer_names())
+        notes = QPlainTextEdit()
+        notes.setPlaceholderText(
+            "What was found, what was asked of the client or the party, "
+            "what evidence was obtained, and the conclusion")
+        notes.setMinimumHeight(110)
+        if record:
+            state.setCurrentIndex(max(0, state.findText(
+                record.get("state", ""))))
+            nature.setCurrentIndex(max(0, nature.findText(
+                record.get("nature", ""))))
+            owner.setEditText(record.get("owner", ""))
+            notes.setPlainText(record.get("notes", ""))
+        elif row.get("status") == STATUS_REVIEW:
+            nature.setCurrentIndex(nature.findText(
+                "Reply could not be matched or read"))
+        state.setObjectName("audit_state")
+        nature.setObjectName("audit_nature")
+        owner.setObjectName("audit_owner")
+        notes.setObjectName("audit_notes")
+        form.addRow("Follow-up", state)
+        form.addRow("Nature of difference", nature)
+        form.addRow("Owner", owner)
+        form.addRow("Notes", notes)
+        layout.addLayout(form)
+
+        if record and record.get("history"):
+            past = QLabel("<b>History</b><br>" + "<br>".join(
+                "%s - %s - %s" % (
+                    xml_escape(str(h.get("at", "")).replace("T", " ")),
+                    xml_escape(h.get("by") or "unnamed"),
+                    xml_escape(h.get("state", "")))
+                for h in record["history"][-6:]))
+            past.setWordWrap(True)
+            layout.addWidget(past)
+
+        problem = QLabel("")
+        problem.setObjectName("audit_problem")
+        problem.setStyleSheet("color: %s;" % T["err"])
+        layout.addWidget(problem)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        save = buttons.addButton("Save record",
+                                 QDialogButtonBox.ButtonRole.AcceptRole)
+        save.setObjectName("audit_save")
+        layout.addWidget(buttons)
+        result = {}
+
+        def try_save():
+            if not owner.currentText().strip():
+                problem.setText("Enter who owns this follow-up.")
+                return
+            result.update(state=state.currentText(),
+                          nature=nature.currentText(),
+                          owner=owner.currentText().strip(),
+                          notes=notes.toPlainText().strip())
+            dialog.accept()
+
+        save.clicked.connect(try_save)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not result:
+            return None
+        return result
 
     # --------------------------------------------------------- the exports
     def report_heading(self):
@@ -441,6 +800,9 @@
         client = self.active_client()
         year = self.active_fy()
         store = self.db.setdefault("replies", [])
+        for held in store:      # dates recorded a day early by older builds
+            if held.get("received_at"):
+                held["received_at"] = local_stamp(held["received_at"])
         known = {r.get("id") for r in store}
         added = offered = 0
         for reply in incoming:
@@ -449,6 +811,8 @@
             offered += 1
             reply = dict(reply)
             reply.setdefault("id", new_id())
+            if reply.get("received_at"):
+                reply["received_at"] = local_stamp(reply["received_at"])
             if reply["id"] in known:            # never count a reply twice
                 # ...but learn what is attached, if the bridge now says so
                 if reply.get("files"):

@@ -355,19 +355,19 @@ CASES = [
     ("a bare number", "Outstanding as per our ledger is 2500000.", None,
      "Mismatch", 2500000.0),
     ("the slip completed with the same figure",
-     "PFA.", LETTER % FILLED_SAME, "Agreed", 3500000.0),
+     "PFA.", LETTER % FILLED_SAME, bcg.STATUS_AGREED, 3500000.0),
     ("agreed in the party's own words",
      "We confirm the balance of Rs. 35,00,000 is correct.", None,
-     "Agreed", 3500000.0),
+     bcg.STATUS_AGREED, 3500000.0),
     ("the letter merely returned, slip unread",
-     "PFA.", LETTER % BLANK, "Needs review", None),
+     "PFA.", LETTER % BLANK, bcg.STATUS_REVIEW, None),
     ("disputed without a figure",
      "The balance is not in agreement with our records.", LETTER % BLANK,
-     "Needs review", None),
+     bcg.STATUS_REVIEW, None),
     ("dates, pincodes and phone numbers are not figures",
      "Received on 10.11.2026 at our office (400002). Call 9876543210. "
      "Will revert on the balance as on 31 March 2026.", None,
-     "Needs review", None),
+     bcg.STATUS_REVIEW, None),
 ]
 for label, body, attachment, status, amount in CASES:
     row, _ = outcome(body, attachment)
@@ -386,7 +386,7 @@ check("a returned letter is explained, not guessed",
       "could not be read" in row["note"], row["note"])
 quoted_only, _ = outcome("Noted, will revert.")
 check("the figure in our own quoted e-mail is never read back",
-      quoted_only["status"] == "Needs review" and
+      quoted_only["status"] == bcg.STATUS_REVIEW and
       quoted_only["confirmed_amount"] is None)
 
 print("\n== 5. Our own request is not a reply ==")
@@ -459,7 +459,7 @@ check("XYZ shows as a Mismatch on the page",
 check("with the variance against the client's books",
       abs(rows["XYZ Suppliers LLP"]["variance"] - (2500000 - 3515723.34))
       < 0.01, rows["XYZ Suppliers LLP"]["variance"])
-check("ABC still agrees", rows["ABC Private Limited"]["status"] == "Agreed")
+check("ABC still agrees", rows["ABC Private Limited"]["status"] == bcg.STATUS_AGREED)
 check("the summary counts one mismatch", win.recon_summary["variance"] == 1)
 check("the copy of our own request is set aside and said so",
       len(win.recon_ignored) == 1 and

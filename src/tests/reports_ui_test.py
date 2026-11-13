@@ -187,7 +187,8 @@ for index in range(win.report_combo.count()):
     check("%s renders" % title, columns > 1)
 expected = {"Confirmation register": 4, "Confirmations received": 2,
             "Pending confirmations": 2, "Requested vs confirmed": 4,
-            "Consolidated variance report": 4, "Exception queue": 1}
+            "Consolidated variance report": 4, "Exception queue": 1,
+            "Audit status": 0}
 for index in range(win.report_combo.count()):
     win.report_combo.setCurrentIndex(index)
     pump(2)
@@ -210,7 +211,8 @@ check("pdf written", os.path.exists(pdf) and os.path.getsize(pdf) > 5000,
 
 workbook = openpyxl.load_workbook(xlsx)
 check("one sheet per report plus a cover",
-      len(workbook.sheetnames) == 7, workbook.sheetnames)
+      len(workbook.sheetnames) == len(bcg.REPORT_TITLES) + 1,
+      workbook.sheetnames)
 comparison = workbook["Requested vs confirmed"]
 check("headings frozen", comparison.freeze_panes == "A5",
       comparison.freeze_panes)
@@ -226,6 +228,7 @@ for mode in ("dark", "light"):
     win.set_mode(mode)
     pump(4)
     win.go("recon")
+    win.show_report(bcg.REPORT_COMPARISON)
     pump(3)
     win.grab().save(os.path.join(WORK, "recon-%s.png" % mode))
     win.go("dashboard")
