@@ -38,6 +38,7 @@ def blank_db():
         "clients": [],
         "runs": [],
         "replies": [],
+        "audit_status": [],      # follow-up records, one for a request
         "settings": {
             "firm_name": "Ankit Soni and Associates",
             "firm_designation": "Statutory Auditor",
@@ -86,6 +87,7 @@ def normalise_db(data):
         db["clients"] = data.get("clients") or []
         db["runs"] = data.get("runs") or []
         db["replies"] = data.get("replies") or []
+        db["audit_status"] = data.get("audit_status") or []
         settings = data.get("settings") or {}
         mail = dict(db["settings"]["mail"])
         mail.update(settings.get("mail") or {})

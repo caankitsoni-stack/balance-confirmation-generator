@@ -9,6 +9,8 @@
 #
 # Column spec: (heading, key, kind) where kind is
 #   "text" | "money" | "number" | "date" | "pct" | "status"
+#   "link"   - text on paper; on screen a link that opens the related record
+#   "action" - on screen only (a Review link); left out of the exports
 # ===========================================================================
 
 REPORT_REGISTER = "register"
@@ -17,6 +19,7 @@ REPORT_PENDING = "pending"
 REPORT_COMPARISON = "comparison"
 REPORT_VARIANCE = "variance"
 REPORT_EXCEPTIONS = "exceptions"
+REPORT_AUDIT = "audit"
 
 REPORT_TITLES = [
     (REPORT_REGISTER, "Confirmation register",
@@ -30,8 +33,10 @@ REPORT_TITLES = [
     (REPORT_VARIANCE, "Consolidated variance report",
      "Differences by category, with coverage"),
     (REPORT_EXCEPTIONS, "Exception queue",
-     "Nothing here is counted until you clear it - select a reply and "
-     "use Assign reply"),
+     "Nothing here is counted until you decide it - click Review on a "
+     "reply"),
+    (REPORT_AUDIT, "Audit status",
+     "Follow-up on every mismatch and every reply under review"),
 ]
 
 
@@ -57,7 +62,8 @@ def build_report(kind, rows, exceptions, context=None):
                    ("Reply received", "received_at", "date"),
                    ("Matched on", "match_basis", "text"),
                    ("Amount confirmed", "confirmed_amount", "money"),
-                   ("Outcome", "status", "status")]
+                   ("Outcome", "status", "status"),
+                   ("Audit status", "audit_state", "link")]
         data = list(rows)
         totals = {"books_amount": sum(abs(r["books_amount"]) for r in data
                                       if r["books_amount"] is not None)}
@@ -111,6 +117,9 @@ def build_report(kind, rows, exceptions, context=None):
                    ("Variance (confirmed less books)", "variance", "money"),
                    ("Variance %", "variance_pct", "pct"),
                    ("Status", "status", "status"),
+                   ("Audit status", "audit_state", "link"),
+                   ("Confirmed by (reply from)", "reply_from", "text"),
+                   ("Reply received", "received_at", "date"),
                    ("Remark", "note", "text")]
         totals = {
             "books_amount": sum(abs(r["books_amount"]) for r in data
@@ -125,13 +134,16 @@ def build_report(kind, rows, exceptions, context=None):
         columns = [("Category", "category", "text"),
                    ("Parties", "parties", "number"),
                    ("Value requested", "requested_value", "money"),
-                   ("Value confirmed", "confirmed_value", "money"),
+                   ("Books value of replies counted", "confirmed_value",
+                    "money"),
                    ("Coverage %", "coverage_pct", "pct"),
-                   ("Agreed", "agreed", "number"),
+                   ("Amount confirmed by parties", "amount_confirmed",
+                    "money"),
+                   ("Matched", "agreed", "number"),
                    ("Mismatch", "variance", "number"),
                    ("Pending", "pending", "number"),
                    ("Returned", "returned", "number"),
-                   ("Needs review", "review", "number"),
+                   ("Needs Review", "review", "number"),
                    ("Net difference", "net_variance", "money"),
                    ("Gross difference", "gross_variance", "money")]
         data = summarise_by_category(rows)
@@ -139,6 +151,7 @@ def build_report(kind, rows, exceptions, context=None):
         totals = {"parties": sum(d["parties"] for d in data),
                   "requested_value": overall["requested_value"],
                   "confirmed_value": overall["confirmed_value"],
+                  "amount_confirmed": overall["amount_confirmed"],
                   "coverage_pct": _pct(overall["coverage_pct"]),
                   "agreed": overall["agreed"],
                   "variance": overall["variance"],
@@ -149,16 +162,50 @@ def build_report(kind, rows, exceptions, context=None):
                   "gross_variance": overall["gross_variance"]}
 
     elif kind == REPORT_EXCEPTIONS:
-        columns = [("Reason", "reason", "text"),
+        columns = [("Action", "review", "action"),
+                   ("Reason", "reason", "text"),
                    ("From", "from_email", "text"),
                    ("Received", "received_at", "date"),
                    ("Amount read", "amount", "money"),
-                   ("Possible party", "candidates", "text"),
+                   ("Suggested party", "suggested_party", "text"),
+                   ("Evidence points to", "candidates", "text"),
                    ("Subject", "subject", "text"),
                    ("Name on the reply", "from_name", "text"),
                    ("Confidence", "confidence", "pct_unit")]
         data = list(exceptions)
         totals = {}
+
+    elif kind == REPORT_AUDIT:
+        columns = [("Party", "party_name", "text"),
+                   ("Category", "category", "text"),
+                   ("Reference", "reference", "text"),
+                   ("As per client's books", "books_amount", "money"),
+                   ("Confirmed by party", "confirmed_amount", "money"),
+                   ("Variance", "variance", "money"),
+                   ("Confirmation status", "confirmation_status", "status"),
+                   ("Follow-up", "state", "link"),
+                   ("Nature of difference", "nature", "text"),
+                   ("Notes", "notes", "text"),
+                   ("Owner", "owner", "text"),
+                   ("Reply from", "reply_from", "text"),
+                   ("Reply received", "reply_received_at", "date"),
+                   ("Opened", "created_at", "date"),
+                   ("Last updated", "updated_at", "date")]
+        # the record shows the position as it stands NOW, not as it stood
+        # when the record was opened
+        current = {r.get("document_id"): r for r in rows}
+        data = []
+        for record in context.get("audit_records") or []:
+            if record.get("document_id") not in current:
+                continue
+            entry = dict(record)
+            entry.update(audit_snapshot(current[record["document_id"]]))
+            entry["state_link"] = "Open record: %s" % entry.get("state", "")
+            data.append(entry)
+        data.sort(key=lambda e: (e.get("state") not in AUDIT_OPEN_STATES,
+                                 str(e.get("party_name", "")).lower()))
+        totals = {"variance": sum(e["variance"] for e in data
+                                  if e.get("variance") is not None)}
 
     else:
         raise ValueError("Unknown report: %s" % kind)
@@ -169,8 +216,14 @@ def build_report(kind, rows, exceptions, context=None):
 
 
 def build_all_reports(rows, exceptions, context=None):
-    return [build_report(key, rows, exceptions, context)
-            for key, _title, _sub in REPORT_TITLES]
+    """Every report as it goes on paper: the screen-only action column is
+    left out."""
+    reports = [build_report(key, rows, exceptions, context)
+               for key, _title, _sub in REPORT_TITLES]
+    for report in reports:
+        report["columns"] = [column for column in report["columns"]
+                             if column[2] != "action"]
+    return reports
 
 
 def format_cell(value, kind, currency="INR"):

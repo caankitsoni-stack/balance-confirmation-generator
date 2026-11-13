@@ -155,7 +155,7 @@
         for key, value, meta, accent in (
                 ("Sent", summary["sent"], "Confirmations issued", T["accent"]),
                 ("Received", summary["received"], "Replies matched", T["info"]),
-                ("Agreed", summary["agreed"], "Within tolerance", T["ok"]),
+                ("Matched", summary["agreed"], "No variance", T["ok"]),
                 ("With variance", summary["variance"], "Difference found",
                  T["warn"]),
                 ("Pending", summary["pending"], "No reply yet",
