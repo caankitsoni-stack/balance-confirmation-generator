@@ -125,6 +125,10 @@ def normalise_db(data):
     if legacy_body in (db["settings"]["mail"].get("body") or ""):
         db["settings"]["mail"]["body"] = DEFAULT_BODY
         db["settings"]["mail"]["subject"] = DEFAULT_SUBJECT
+    # the stock subject now carries the reference code; a subject the
+    # auditor wrote themselves is left exactly as it is
+    if db["settings"]["mail"].get("subject") == LEGACY_SUBJECT:
+        db["settings"]["mail"]["subject"] = DEFAULT_SUBJECT
     db["version"] = DB_VERSION
     return db
 

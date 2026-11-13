@@ -67,6 +67,12 @@
         self.report_note = QLabel("")
         self.report_note.setObjectName("HintLight")
         header2.addWidget(self.report_note)
+        self.btn_assign = button("Assign reply…")
+        self.btn_assign.setToolTip(
+            "Decide which party a reply in the exception queue belongs to, "
+            "or set it aside as not being a confirmation")
+        self.btn_assign.clicked.connect(self.assign_selected_reply)
+        header2.addWidget(self.btn_assign)
         excel = button("Export all to Excel", "primary")
         excel.clicked.connect(self.export_reports_excel)
         pdf = button("Export all to PDF", "blue")
@@ -140,6 +146,7 @@
         settings = self.db["settings"]
         mail = settings.get("mail") or {}
         self.recon_ignored = []
+        self.recon_set_aside = []
         self.recon_rows, self.recon_exceptions = build_reconciliation(
             documents, replies,
             tolerance=float(settings.get("variance_tolerance",
@@ -148,7 +155,7 @@
             # the request is copied to the team, so it comes back through the
             # bridge: our own letter must never be counted as a reply
             own_addresses=(mail.get("username"), mail.get("sender")),
-            ignored=self.recon_ignored)
+            ignored=self.recon_ignored, set_aside=self.recon_set_aside)
         self.recon_summary = summarise(self.recon_rows)
 
         client = self.active_client()
@@ -158,10 +165,12 @@
             % (client["name"] if client else "no client",
                year["year"] if year else "no year",
                len(documents), len(replies) - len(self.recon_ignored),
-               (" · %d cop%s of your own request ignored"
-                % (len(self.recon_ignored),
-                   "y" if len(self.recon_ignored) == 1 else "ies"))
-               if self.recon_ignored else "")
+               ((" · %d cop%s of your own request ignored"
+                 % (len(self.recon_ignored),
+                    "y" if len(self.recon_ignored) == 1 else "ies"))
+                if self.recon_ignored else "") +
+               ((" · %d set aside" % len(self.recon_set_aside))
+                if self.recon_set_aside else ""))
             if client else "Select a client to see its position")
 
         summary = self.recon_summary
@@ -172,6 +181,8 @@
                 ("Agreed", summary["agreed"], "Within tolerance", T["ok"]),
                 ("Mismatch", summary["variance"],
                  "Differs from books", T["err"]),
+                ("Review", len(self.recon_exceptions),
+                 "Replies to decide", T["warn"]),
                 ("Pending", summary["pending"], "No reply yet", T["text_mute"]),
                 ("Returned", summary["returned"], "Undelivered", T["err"]),
                 ("Coverage", "%.1f%%" % summary["coverage_pct"],
@@ -199,6 +210,8 @@
                                   self.db["settings"].get("reminder_days",
                                                           DEFAULT_REMINDERS))})
         self.report_subtitle.setText(report["subtitle"])
+        if hasattr(self, "btn_assign"):
+            self.btn_assign.setVisible(key == REPORT_EXCEPTIONS)
         headings = [h for h, _k, _t in report["columns"]]
         self.report_table.clear()
         self.report_table.setColumnCount(len(headings))
@@ -237,6 +250,99 @@
         self.report_note.setText("%d row%s" % (len(report["rows"]),
                                                "" if len(report["rows"]) == 1
                                                else "s"))
+
+    # ------------------------------------------- deciding a reply by hand
+    def assign_reply(self, reply_id, target):
+        """Record the auditor's decision on one reply.
+
+        target is a confirmation's id, SET_ASIDE (not a confirmation for any
+        party), or "" to hand the reply back to automatic matching.  The
+        decision and when it was made are kept on the reply itself."""
+        for reply in self.db.get("replies", []):
+            if str(reply.get("id")) != str(reply_id):
+                continue
+            if target:
+                reply["assigned_to"] = target
+                reply["assigned_at"] = datetime.now().isoformat(
+                    timespec="seconds")
+            else:
+                reply.pop("assigned_to", None)
+                reply.pop("assigned_at", None)
+            self.persist()
+            self.refresh_recon()
+            return True
+        return False
+
+    def assign_selected_reply(self):
+        if self.report_combo.currentData() != REPORT_EXCEPTIONS:
+            self.toast("Open the Exception queue and select a reply first.",
+                       "warn")
+            return
+        index = self.report_table.currentRow()
+        queue = getattr(self, "recon_exceptions", [])
+        if index < 0 or index >= len(queue):
+            self.toast("Select a reply in the Exception queue first.", "warn")
+            return
+        entry = queue[index]
+        if not entry.get("reply_id"):
+            self.toast("That row has no reply to assign.", "warn")
+            return
+        target = self.choose_party_dialog(entry)
+        if target is None:
+            return
+        self.assign_reply(entry["reply_id"], target)
+        if target == SET_ASIDE:
+            self.toast("Reply set aside: it is kept on record but not "
+                       "counted.", "ok")
+        elif target:
+            party = next((d.get("party_name") for d in self.sent_documents()
+                          if document_key(d) == target), "the party")
+            self.toast("Reply recorded against %s." % party, "ok")
+        else:
+            self.toast("Reply handed back to automatic matching.", "ok")
+
+    def choose_party_dialog(self, entry):
+        """Ask which confirmation a reply answers.  Returns a document id,
+        SET_ASIDE, "" for automatic matching, or None if cancelled."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Assign reply")
+        layout = QVBoxLayout(dialog)
+        facts = QLabel(
+            "<b>From:</b> %s<br><b>Received:</b> %s<br><b>Subject:</b> %s"
+            "<br><b>Amount read:</b> %s<br><b>Why it is here:</b> %s" % (
+                xml_escape(entry.get("from_email") or "unknown"),
+                xml_escape(fmt_date_long(str(entry.get("received_at")
+                                             or "")[:10]) or
+                           str(entry.get("received_at") or "")),
+                xml_escape(entry.get("subject") or ""),
+                xml_escape(fmt_amount(entry.get("amount"),
+                                      entry.get("currency") or "INR")
+                           or "none"),
+                xml_escape(entry.get("reason") or "")))
+        facts.setWordWrap(True)
+        layout.addWidget(facts)
+        layout.addWidget(QLabel("Record this reply against:"))
+        combo = QComboBox()
+        for document in sorted(self.sent_documents(),
+                               key=lambda d: (d.get("party_name", "").lower(),
+                                              d.get("category", ""))):
+            combo.addItem("%s — %s — %s" % (
+                document.get("party_name", ""), document.get("category", ""),
+                fmt_amount(document.get("amount"),
+                           document.get("currency") or "INR")),
+                document_key(document))
+        combo.addItem("Set aside — not a confirmation for any party",
+                      SET_ASIDE)
+        combo.addItem("Return it to automatic matching", "")
+        layout.addWidget(combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                   QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return combo.currentData()
 
     # --------------------------------------------------------- the exports
     def report_heading(self):

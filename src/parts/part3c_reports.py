@@ -30,7 +30,8 @@ REPORT_TITLES = [
     (REPORT_VARIANCE, "Consolidated variance report",
      "Differences by category, with coverage"),
     (REPORT_EXCEPTIONS, "Exception queue",
-     "Nothing here is counted until you clear it"),
+     "Nothing here is counted until you clear it - select a reply and "
+     "use Assign reply"),
 ]
 
 
@@ -52,6 +53,10 @@ def build_report(kind, rows, exceptions, context=None):
                    ("Reference", "reference", "text"),
                    ("Date sent", "sent_at", "date"),
                    ("Delivery", "delivery", "text"),
+                   ("Reply from", "reply_from", "text"),
+                   ("Reply received", "received_at", "date"),
+                   ("Matched on", "match_basis", "text"),
+                   ("Amount confirmed", "confirmed_amount", "money"),
                    ("Outcome", "status", "status")]
         data = list(rows)
         totals = {"books_amount": sum(abs(r["books_amount"]) for r in data
@@ -63,8 +68,9 @@ def build_report(kind, rows, exceptions, context=None):
         columns = [("Party", "party_name", "text"),
                    ("Category", "category", "text"),
                    ("Date received", "received_at", "date"),
+                   ("Reply from", "reply_from", "text"),
                    ("Amount confirmed", "confirmed_amount", "money"),
-                   ("Matched by", "match_method", "text"),
+                   ("Matched on", "match_basis", "text"),
                    ("Match confidence", "match_confidence", "pct_unit"),
                    ("Read from", "extract_source", "text"),
                    ("Read confidence", "extract_confidence", "pct_unit"),
@@ -145,10 +151,11 @@ def build_report(kind, rows, exceptions, context=None):
     elif kind == REPORT_EXCEPTIONS:
         columns = [("Reason", "reason", "text"),
                    ("From", "from_email", "text"),
-                   ("Name on the reply", "from_name", "text"),
-                   ("Subject", "subject", "text"),
                    ("Received", "received_at", "date"),
                    ("Amount read", "amount", "money"),
+                   ("Possible party", "candidates", "text"),
+                   ("Subject", "subject", "text"),
+                   ("Name on the reply", "from_name", "text"),
                    ("Confidence", "confidence", "pct_unit")]
         data = list(exceptions)
         totals = {}

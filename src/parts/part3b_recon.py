@@ -72,71 +72,356 @@ MATCH_THREAD = "thread"
 MATCH_REFERENCE = "reference"
 MATCH_SENDER = "sender address"
 MATCH_NAME = "party name"
+MATCH_DOMAIN = "sender's domain"
+MATCH_MANUAL = "assigned by hand"
 MATCH_NONE = "unmatched"
 
+# a reply the auditor has marked as not being a confirmation for any party
+SET_ASIDE = "__set_aside__"
+
 NAME_MATCH_THRESHOLD = 90
+
+# A shared mail service says nothing about which company a sender works for,
+# so only a company's own domain is used as evidence of who replied.
+PUBLIC_MAIL_DOMAINS = frozenset((
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.in", "yahoo.in",
+    "ymail.com", "rocketmail.com", "outlook.com", "outlook.in", "hotmail.com",
+    "hotmail.co.in", "live.com", "live.in", "msn.com", "icloud.com",
+    "me.com", "mac.com", "aol.com", "rediffmail.com", "rediff.com",
+    "zoho.com", "zohomail.com", "zohomail.in", "protonmail.com", "proton.me",
+    "pm.me", "gmx.com", "gmx.net", "mail.com", "yandex.com", "yandex.ru",
+    "tutanota.com", "fastmail.com", "hey.com", "sify.com", "vsnl.net",
+    "vsnl.com", "bsnl.in", "airtelmail.in", "indiatimes.com"))
+
+_ADDRESS_RE = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+_LEGAL_SUFFIX = (r"(?:pvt|private|ltd|limited|llp|inc|co|company|corp|"
+                 r"corporation|plc|llc|gmbh|bhd)")
+_DROPPED_WORDS = r"(?:and|the|co|company|private|pvt|limited|ltd|llp|inc)"
+
+
+def addresses_in(text):
+    """Every e-mail address in a field, lower-cased.  A party's e-mail cell
+    may hold more than one address."""
+    return {found.lower().rstrip(".")
+            for found in _ADDRESS_RE.findall(str(text or ""))}
+
+
+def document_key(document):
+    return document.get("id") or document.get("filename")
+
+
+def _party_key(document):
+    return _norm_name(document.get("party_name")) or str(document_key(document))
+
+
+def _message_id(value):
+    return str(value or "").strip().strip("<>").strip().lower()
+
+
+def _fold(text):
+    return re.sub(r"\s+", " ",
+                  re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())).strip()
+
+
+def _name_pattern(party_name):
+    """A pattern that finds a party's name as a whole phrase.
+
+    'ABC Pvt Ltd' must not be found inside 'ABCD' or in the word 'abc' in
+    passing, so a one-word name only counts when a legal suffix follows it
+    ('ABC Pvt Ltd', 'ABC Limited').  Longer names count as a phrase."""
+    tokens = _norm_name(party_name).split()
+    if not tokens:
+        return None
+    joiner = r"(?:\s+" + _DROPPED_WORDS + r")*\s+"
+    phrase = joiner.join(re.escape(token) for token in tokens)
+    if len(tokens) == 1:
+        phrase += r"(?:\s+" + _DROPPED_WORDS + r")*\s+" + _LEGAL_SUFFIX
+    return re.compile(r"\b" + phrase + r"\b")
+
+
+def parties_named_in(text, documents):
+    """{party key: [documents]} for every party whose name is written in the
+    text.  Where one name sits inside a longer one ('ABC' within 'ABC
+    Exports'), only the longer, more specific name counts."""
+    folded = _fold(text)
+    if not folded:
+        return {}
+    spans = {}
+    for document in documents:
+        pattern = _name_pattern(document.get("party_name"))
+        if pattern is None:
+            continue
+        found = [(m.start(), m.end()) for m in pattern.finditer(folded)]
+        if found:
+            spans.setdefault(_party_key(document), {"spans": found,
+                                                    "documents": []})
+            spans[_party_key(document)]["documents"].append(document)
+    named = {}
+    for key, entry in spans.items():
+        inside_longer = all(
+            any(other_key != key and o_start <= start and end <= o_end and
+                (o_end - o_start) > (end - start)
+                for other_key, other in spans.items()
+                for o_start, o_end in other["spans"])
+            for start, end in entry["spans"])
+        if not inside_longer:
+            named[key] = entry["documents"]
+    return named
+
+
+def _names_of(documents):
+    seen, out = set(), []
+    for document in documents:
+        name = document.get("party_name") or str(document_key(document))
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return ", ".join(out)
+
+
+def _describe(document):
+    category = document.get("category") or ""
+    return "%s%s" % (document.get("party_name", ""),
+                     " (%s)" % category if category else "")
+
+
+def assess_reply(reply, documents):
+    """Work out which sent confirmation a reply answers, on evidence only.
+
+    Two separate questions are asked of every reply:
+
+      who sent it   - the sender's address registered for a party, the
+                      party's name written in the party's OWN words (not in
+                      our letter quoted underneath), or a company's own
+                      domain;
+      what it answers - the request it is a reply to (In-Reply-To or the
+                      thread), our reference code, or the returned letter.
+
+    The reply is recorded against a party only when the evidence points to
+    exactly one confirmation.  Evidence that disagrees, or no evidence at
+    all, sends the reply to the exception queue: it is never given to the
+    first party on the list, and the order replies arrive in plays no part.
+
+    Returns {document, method, confidence, basis, note, reason, candidates}.
+    """
+    result = {"document": None, "method": MATCH_NONE, "confidence": 0.0,
+              "basis": "", "note": "", "reason": "", "candidates": ""}
+    documents = [d for d in documents if document_key(d)]
+    by_key = {document_key(d): d for d in documents}
+
+    # -- the auditor's own decision overrides everything
+    assigned = str(reply.get("assigned_to") or "")
+    if assigned and assigned != SET_ASIDE:
+        document = by_key.get(assigned)
+        if document is not None:
+            result.update(document=document, method=MATCH_MANUAL,
+                          confidence=1.0,
+                          basis="Assigned by hand to %s" % _describe(document))
+            return result
+        result["reason"] = ("Assigned by hand to a confirmation that is no "
+                            "longer on record - assign it again")
+        return result
+
+    subject = str(reply.get("subject") or "")
+    body = str(reply.get("body") or "")
+    own_words = strip_quoted(body)
+    attachment_texts = [str(a.get("text") or "")
+                        for a in (reply.get("attachments") or [])]
+    sender = next(iter(sorted(addresses_in(reply.get("from_email")))), "")
+    bounced = bool(reply.get("bounced")) or looks_like_bounce(reply)
+
+    # ------------------------------------------------ who sent the reply
+    sender_hits = [d for d in documents
+                   if sender and sender in addresses_in(d.get("email"))]
+    domain_hits = []
+    if sender and not sender_hits and not bounced:
+        domain = sender.rsplit("@", 1)[-1]
+        if domain not in PUBLIC_MAIL_DOMAINS:
+            domain_hits = [d for d in documents if any(
+                address.rsplit("@", 1)[-1] == domain
+                for address in addresses_in(d.get("email")))]
+    named = {} if bounced else parties_named_in(
+        own_words + "\n" + str(reply.get("from_name") or ""), documents)
+    name_hits = [d for docs in named.values() for d in docs]
+
+    identity_signals = []
+    if sender_hits:
+        identity_signals.append(
+            (MATCH_SENDER, {_party_key(d) for d in sender_hits},
+             "sent from %s, the address on record for %s"
+             % (sender, _names_of(sender_hits))))
+    if name_hits:
+        identity_signals.append(
+            (MATCH_NAME, set(named),
+             "the reply names %s in the party's own words"
+             % _names_of(name_hits)))
+    if domain_hits:
+        identity_signals.append(
+            (MATCH_DOMAIN, {_party_key(d) for d in domain_hits},
+             "sent from the domain %s, used only by %s"
+             % (sender.rsplit("@", 1)[-1], _names_of(domain_hits))))
+
+    identity, identity_kind = set(), ""
+    if identity_signals:
+        identity = set(identity_signals[0][1])
+        identity_kind = identity_signals[0][0]
+        for _kind, parties, _words in identity_signals[1:]:
+            identity &= parties
+        if not identity:
+            result["reason"] = (
+                "The evidence of who replied disagrees: %s - decide which "
+                "party this reply belongs to"
+                % "; ".join(words for _k, _p, words in identity_signals))
+            result["candidates"] = _names_of(
+                [d for _k, parties, _w in identity_signals
+                 for d in documents if _party_key(d) in parties])
+            return result
+    identity_words = "; ".join(words for _k, _p, words in identity_signals)
+
+    # ------------------------------------------- which letter it answers
+    letter, letter_words = {}, []
+
+    def note_letter(found, kind, words):
+        for document in found:
+            letter.setdefault(document_key(document), (document, kind))
+        if found:
+            letter_words.append(words % _names_of(found))
+
+    thread = str(reply.get("thread_id") or "").strip()
+    parent = _message_id(reply.get("in_reply_to"))
+    by_thread = [d for d in documents
+                 if (thread and str(d.get("thread_id") or "") == thread) or
+                 (parent and _message_id(d.get("message_id")) == parent)]
+    note_letter(by_thread, MATCH_THREAD,
+                "it is a reply to the request sent to %s")
+
+    explicit_codes = set()
+    for text in [subject, own_words] + attachment_texts:
+        explicit_codes |= {(REFERENCE_PREFIX + "-" + m).upper()
+                           for m in REFERENCE_RE.findall(text)}
+    by_code = [d for d in documents
+               if str(d.get("reference") or "").upper() in explicit_codes]
+    note_letter(by_code, MATCH_REFERENCE,
+                "it carries the reference code of the letter to %s")
+
+    strong_letter = dict(letter)
+    if not strong_letter:
+        # weaker: a code only in the quoted text, the party named on the
+        # returned letter, or the failed address inside a bounce
+        quoted_codes = {(REFERENCE_PREFIX + "-" + m).upper()
+                        for m in REFERENCE_RE.findall(body)}
+        if reply.get("reference"):
+            quoted_codes.add(str(reply["reference"]).upper())
+        by_quoted = [d for d in documents
+                     if str(d.get("reference") or "").upper() in quoted_codes]
+        note_letter(by_quoted, MATCH_REFERENCE,
+                    "the letter to %s is quoted in it")
+        on_letter = parties_named_in("\n".join(attachment_texts), documents)
+        if len(on_letter) == 1:
+            note_letter(list(on_letter.values())[0], MATCH_NAME,
+                        "the returned letter is addressed to %s")
+        if bounced:
+            failed = addresses_in(body)
+            note_letter([d for d in documents
+                         if addresses_in(d.get("email")) & failed],
+                        MATCH_THREAD, "the failed address is the one for %s")
+
+    def choose(document, method, confidence, basis, note=""):
+        result.update(document=document, method=method,
+                      confidence=confidence, basis=basis, note=note)
+        return result
+
+    def basis_of(*parts):
+        text = "; ".join(p for p in parts if p)
+        return text[:1].upper() + text[1:]
+
+    letter_text = "; ".join(letter_words)
+
+    if identity:
+        candidates = [d for d in documents if _party_key(d) in identity]
+        if letter:
+            within = [d for d in candidates if document_key(d) in letter]
+            if len(within) == 1:
+                document = within[0]
+                method = letter[document_key(document)][1]
+                if method == MATCH_NAME:
+                    method = identity_kind
+                return choose(document, method, 0.97,
+                              basis_of(identity_words, letter_text))
+            if len(within) > 1:
+                result["reason"] = (
+                    "The reply could answer more than one confirmation for "
+                    "%s (%s) - decide which" % (_names_of(within), ", ".join(
+                        d.get("category", "") for d in within)))
+                result["candidates"] = "; ".join(_describe(d) for d in within)
+                return result
+            # who replied and what they replied to point to different parties
+            others = [entry[0] for entry in letter.values()]
+            parties_in_identity = {_party_key(d) for d in candidates}
+            # The sender's own registered address is the one thing that says
+            # who is speaking; a reply-all on another party's request says
+            # only which e-mail they pressed Reply on.
+            if identity_kind == MATCH_SENDER and len(candidates) == 1 and \
+                    len(parties_in_identity) == 1:
+                document = candidates[0]
+                return choose(
+                    document, MATCH_SENDER, 0.80,
+                    basis_of(identity_words, letter_text),
+                    note=("Sent from the address on record for %s, but as a "
+                          "reply to the request sent to %s; recorded against "
+                          "%s - confirm before relying on it"
+                          % (document.get("party_name", ""),
+                             _names_of(others),
+                             document.get("party_name", ""))))
+            result["reason"] = ("Who replied (%s) and what the reply answers "
+                                "(%s) point to different parties - decide "
+                                "which" % (identity_words, letter_text))
+            result["candidates"] = _names_of(candidates + others)
+            return result
+        if len(candidates) == 1:
+            confidence = {MATCH_SENDER: 0.92, MATCH_NAME: 0.75,
+                          MATCH_DOMAIN: 0.72}.get(identity_kind, 0.7)
+            return choose(candidates[0], identity_kind, confidence,
+                          basis_of(identity_words))
+        if len({_party_key(d) for d in candidates}) == 1:
+            result["reason"] = (
+                "%s has %d confirmations (%s) and the reply does not show "
+                "which one it answers" % (
+                    candidates[0].get("party_name", ""), len(candidates),
+                    ", ".join(d.get("category", "") for d in candidates)))
+        else:
+            result["reason"] = ("The reply could be from more than one party "
+                                "(%s) - decide which" % identity_words)
+        result["candidates"] = "; ".join(_describe(d) for d in candidates)
+        return result
+
+    if len(letter) == 1:
+        document, kind = list(letter.values())[0]
+        confidence = 0.95 if strong_letter else 0.80
+        if kind == MATCH_NAME:
+            confidence = 0.70
+        return choose(document, kind, confidence, basis_of(letter_text))
+    if len(letter) > 1:
+        result["reason"] = ("The reply points to more than one letter (%s) "
+                            "- decide which" % letter_text)
+        result["candidates"] = "; ".join(
+            _describe(entry[0]) for entry in letter.values())
+        return result
+
+    result["reason"] = (
+        "Nothing in the reply shows which party sent it: the sender's "
+        "address is not on the party list, it is not a reply to one of the "
+        "requests sent, and it carries no reference code or party name")
+    return result
 
 
 def match_reply(reply, documents):
     """Tie one reply to one sent confirmation.
 
-    documents: the sent confirmations, each a dict carrying at least
-    party_name, email, reference, thread_id and message_id.
-    Returns (document or None, method, confidence 0-1).
-    """
-    haystacks = [reply.get("subject", ""), reply.get("body", "")]
-    for attachment in reply.get("attachments") or []:
-        haystacks.append(attachment.get("text", ""))
-
-    # a) same Gmail thread as the message we sent - the strongest signal
-    thread = str(reply.get("thread_id") or "")
-    if thread:
-        for document in documents:
-            if document.get("thread_id") and document["thread_id"] == thread:
-                return document, MATCH_THREAD, 1.0
-    parent = str(reply.get("in_reply_to") or "")
-    if parent:
-        for document in documents:
-            if document.get("message_id") and document["message_id"] == parent:
-                return document, MATCH_THREAD, 1.0
-
-    # b) our reference code quoted anywhere in the reply
-    reference = reply.get("reference") or find_reference(*haystacks)
-    if reference:
-        for document in documents:
-            if (document.get("reference") or "").upper() == reference.upper():
-                return document, MATCH_REFERENCE, 0.98
-
-    # c) the sender is the address the request went to
-    sender = str(reply.get("from_email") or "").strip().lower()
-    if sender:
-        hits = [d for d in documents
-                if str(d.get("email") or "").strip().lower() == sender]
-        if len(hits) == 1:
-            return hits[0], MATCH_SENDER, 0.9
-        if len(hits) > 1:
-            # same address used for several parties: fall through to the name
-            scored = [(name_similarity(d.get("party_name"), text), d)
-                      for d in hits
-                      for text in haystacks + [reply.get("from_name", "")]]
-            best_score, best = max(scored, key=lambda pair: pair[0])
-            if best_score >= NAME_MATCH_THRESHOLD:
-                return best, MATCH_SENDER, 0.85
-
-    # d) the party's name appears in the reply or its attachment
-    best, best_score = None, 0
-    for document in documents:
-        for text in haystacks + [reply.get("from_name", "")]:
-            score = name_similarity(document.get("party_name"), text)
-            # a long body can contain a name by chance, so require the name to
-            # appear as a phrase, not merely share tokens
-            if score > best_score and _norm_name(document.get("party_name")) \
-                    and _norm_name(document.get("party_name")) in _norm_name(text):
-                best, best_score = document, score
-    if best is not None and best_score >= NAME_MATCH_THRESHOLD:
-        return best, MATCH_NAME, round(0.6 + best_score / 500.0, 2)
-
-    return None, MATCH_NONE, 0.0
+    Returns (document or None, method, confidence 0-1).  See assess_reply
+    for the evidence used and for why a reply may be left unmatched."""
+    found = assess_reply(reply, documents)
+    return found["document"], found["method"], found["confidence"]
 
 
 # ------------------------------------------------------- reading the figure
@@ -554,6 +839,13 @@ def reconcile(document, reply=None, tolerance=DEFAULT_TOLERANCE,
         "signed": False,
         "message_link": "",
         "note": "",
+        # the trail from request to recorded figure, kept on every row
+        "reply_id": "",
+        "reply_from": "",
+        "reply_subject": "",
+        "match_basis": "",
+        "replies_count": 0,
+        "reply_ids": "",
     }
 
     delivery = str(document.get("email_status") or "").lower()
@@ -574,6 +866,10 @@ def reconcile(document, reply=None, tolerance=DEFAULT_TOLERANCE,
     row["match_method"] = reply.get("match_method", "")
     row["match_confidence"] = reply.get("match_confidence", 0.0)
     row["message_link"] = reply.get("message_link", "")
+    row["reply_id"] = reply.get("id", "")
+    row["reply_from"] = reply.get("from_email", "")
+    row["reply_subject"] = reply.get("subject", "")
+    row["match_basis"] = reply.get("match_basis", "")
 
     if reply.get("bounced") or looks_like_bounce(reply):
         row["status"] = STATUS_RETURNED
@@ -624,17 +920,79 @@ def reconcile(document, reply=None, tolerance=DEFAULT_TOLERANCE,
         # how the figure was obtained travels with it into every report
         row["note"] += " (read by OCR from %s - check against the document)" \
             % (row["extract_source"] or "the attachment")
+    if reply.get("match_note"):
+        row["note"] += ". " + reply["match_note"]
     return row
+
+
+def _exception(reason, reply, extraction=None, candidates="",
+               party=""):
+    extraction = extraction or {}
+    return {
+        "reason": reason,
+        "from_email": reply.get("from_email", ""),
+        "from_name": reply.get("from_name", ""),
+        "subject": reply.get("subject", ""),
+        "received_at": reply.get("received_at", ""),
+        "amount": extraction.get("amount"),
+        "currency": extraction.get("currency", ""),
+        "confidence": extraction.get("confidence", 0.0),
+        "candidates": candidates,
+        "party": party,
+        "reply_id": reply.get("id", ""),
+        "message_link": reply.get("message_link", ""),
+    }
+
+
+def _arrival(reply):
+    return (str(reply.get("received_at") or ""), str(reply.get("id") or ""))
+
+
+def settle_replies(matched, tolerance=DEFAULT_TOLERANCE):
+    """Choose the reply that stands for one confirmation.
+
+    Returns (reply or None, conflict).  conflict is a sentence when the
+    replies matched to the party give different figures: that is for the
+    auditor to decide, so neither figure is used.  A later reply never
+    silently replaces an earlier one."""
+    if not matched:
+        return None, ""
+    by_hand = [r for r in matched if r.get("match_method") == MATCH_MANUAL]
+    pool = by_hand or list(matched)
+    answers = [r for r in pool
+               if not (r.get("bounced") or looks_like_bounce(r))]
+    if not answers:
+        return max(pool, key=_arrival), ""
+    readable = [r for r in answers
+                if (r.get("extraction") or {}).get("amount") is not None]
+    if not readable:
+        return max(answers, key=_arrival), ""
+    first = readable[0]["extraction"]["amount"]
+    if all(abs(r["extraction"]["amount"] - first) <= tolerance
+           for r in readable):
+        return max(readable, key=_arrival), ""
+    readable.sort(key=_arrival)
+    parts = ["%s on %s from %s" % (
+        fmt_amount(r["extraction"]["amount"],
+                   r["extraction"].get("currency") or "INR")
+        or r["extraction"]["amount"],
+        fmt_date_long(str(r.get("received_at") or "")[:10])
+        or r.get("received_at") or "an unknown date",
+        r.get("from_email") or "an unknown sender") for r in readable]
+    return max(readable, key=_arrival), (
+        "%d replies matched to this party give different figures (%s) - "
+        "decide which one counts" % (len(readable), "; ".join(parts)))
 
 
 def build_reconciliation(documents, replies, tolerance=DEFAULT_TOLERANCE,
                          reminders=DEFAULT_REMINDERS, today=None,
-                         own_addresses=(), ignored=None):
+                         own_addresses=(), ignored=None, set_aside=None):
     """Match every reply, then reconcile every sent confirmation.
 
     Returns (rows, exceptions).  Exceptions are replies that could not be tied
-    to a party, or whose figure could not be read with confidence - they are
-    never folded into the numbers silently.
+    to a party on the evidence, replies whose evidence disagrees, replies
+    that disagree with one another, and replies whose figure could not be
+    read - they are never folded into the numbers silently.
     """
     by_document, exceptions = {}, []
 
@@ -643,53 +1001,54 @@ def build_reconciliation(documents, replies, tolerance=DEFAULT_TOLERANCE,
             if ignored is not None:          # our own letter, not an answer
                 ignored.append(reply)
             continue
-        document, method, confidence = match_reply(reply, documents)
+        if reply.get("assigned_to") == SET_ASIDE:
+            if set_aside is not None:        # the auditor said: not a reply
+                set_aside.append(reply)
+            continue
+        found = assess_reply(reply, documents)
+        document = found["document"]
         enriched = dict(reply)
-        enriched["match_method"] = method
-        enriched["match_confidence"] = confidence
+        enriched["match_method"] = found["method"]
+        enriched["match_confidence"] = found["confidence"]
+        enriched["match_basis"] = found["basis"]
+        enriched["match_note"] = found["note"]
         enriched["extraction"] = extract_confirmation(
             reply, document.get("amount") if document else None, tolerance)
         if document is None:
-            exceptions.append({
-                "reason": "Sender could not be matched to a party",
-                "from_email": reply.get("from_email", ""),
-                "from_name": reply.get("from_name", ""),
-                "subject": reply.get("subject", ""),
-                "received_at": reply.get("received_at", ""),
-                "amount": enriched["extraction"].get("amount"),
-                "currency": enriched["extraction"].get("currency", ""),
-                "confidence": enriched["extraction"].get("confidence", 0.0),
-                "reply_id": reply.get("id", ""),
-                "message_link": reply.get("message_link", ""),
-            })
+            exceptions.append(_exception(
+                found["reason"] or "Sender could not be matched to a party",
+                reply, enriched["extraction"], found["candidates"]))
             continue
-        key = document.get("id") or document.get("filename")
-        # if two replies match the same party, the later one wins
-        previous = by_document.get(key)
-        if previous is None or str(enriched.get("received_at", "")) >= \
-                str(previous.get("received_at", "")):
-            by_document[key] = enriched
+        by_document.setdefault(document_key(document), []).append(enriched)
 
     rows = []
     for document in documents:
-        key = document.get("id") or document.get("filename")
-        row = reconcile(document, by_document.get(key), tolerance, reminders,
-                        today)
+        key = document_key(document)
+        matched = by_document.get(key, [])
+        chosen, conflict = settle_replies(matched, tolerance)
+        row = reconcile(document, chosen, tolerance, reminders, today)
+        row["replies_count"] = len(matched)
+        row["reply_ids"] = ", ".join(str(r.get("id") or "")
+                                     for r in sorted(matched, key=_arrival))
         rows.append(row)
-        if row["status"] == STATUS_REVIEW and by_document.get(key):
-            reply = by_document[key]
-            exceptions.append({
-                "reason": row["note"] or "Needs review",
-                "from_email": reply.get("from_email", ""),
-                "from_name": row["party_name"],
-                "subject": reply.get("subject", ""),
-                "received_at": reply.get("received_at", ""),
-                "amount": reply.get("extraction", {}).get("amount"),
-                "currency": row["currency"],
-                "confidence": reply.get("extraction", {}).get("confidence", 0.0),
-                "reply_id": reply.get("id", ""),
-                "message_link": reply.get("message_link", ""),
-            })
+        if conflict:
+            row.update(status=STATUS_REVIEW, confirmed_amount=None,
+                       variance=None, variance_pct=None, note=conflict,
+                       extract_confidence=0.0, extract_source="")
+            for reply in sorted(matched, key=_arrival):
+                exceptions.append(_exception(
+                    "Replies matched to %s disagree - decide which one "
+                    "counts" % row["party_name"], reply,
+                    reply.get("extraction"), row["party_name"],
+                    row["party_name"]))
+        elif row["status"] == STATUS_REVIEW and chosen:
+            exceptions.append(_exception(
+                row["note"] or "Needs review", chosen,
+                {"amount": chosen.get("extraction", {}).get("amount"),
+                 "currency": row["currency"],
+                 "confidence": chosen.get("extraction", {}).get(
+                     "confidence", 0.0)},
+                row["party_name"], row["party_name"]))
 
     rows.sort(key=lambda r: (STATUS_ORDER.index(r["status"])
                              if r["status"] in STATUS_ORDER else 99,

@@ -682,7 +682,11 @@ def trim_grid(grid):
 # SECTION 5 - E-MAIL COMPOSITION
 # ===========================================================================
 
-DEFAULT_SUBJECT = "Balance confirmation request as at {date} — {client}"
+LEGACY_SUBJECT = "Balance confirmation request as at {date} — {client}"
+# the reference rides in the subject, so every reply ("Re: ...") carries
+# it back even when the party writes nothing else
+DEFAULT_SUBJECT = ("Balance confirmation request as at {date} — {client} "
+                   "— Ref {reference}")
 DEFAULT_BODY = "\n".join([
     "Dear Sir/Madam,",
     "",
