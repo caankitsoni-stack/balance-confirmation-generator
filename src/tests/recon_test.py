@@ -147,7 +147,8 @@ check("Customer P matched, so not pending",
       by_party["Customer P Ltd"]["status"])
 check("two unmatched replies went to exceptions",
       len([e for e in exceptions
-           if e["reason"].startswith("Sender could not")]) == 2,
+           if e["reason"].startswith("Nothing in the reply shows which "
+                                      "party sent it")]) == 2,
       exceptions)
 check("exception keeps the figure it read but does not post it",
       any(e["amount"] == 44000.0 for e in exceptions), exceptions)
